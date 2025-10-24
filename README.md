@@ -2,7 +2,7 @@
 
 ## Goal:
 Use Algorithm 1 from "Hermitian matrices for clustering directed graphs: insights and applications" 
-to create an iterative algorithm that will find a better clustering for a given digraph, given we know the true meta graph.
+to create an iterative algorithm that will find a better clustering for a given digraph, given we know the true underlying meta graph.
 
 ## Work in progress
 These functions are not doing as well as we'd like yet. This is ongoing work started from a 285J class project.
