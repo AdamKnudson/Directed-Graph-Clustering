@@ -11,3 +11,4 @@ Also a note: need to correct a small bug in Algorithm 1. We are currently taking
 k largest eigenvalues, but we should be taking the k largest eigenvalues in magnitude. 
 Even with this error, the results of the algorithm seemed to match quite well with the results found in the original paper
 so it is unclear if this could significantly improve these Algorithms, however, it should still get fixed.
+-- Fixed (but left old vversion in in case useful for testing.) New version is Algorithm1FIXED
