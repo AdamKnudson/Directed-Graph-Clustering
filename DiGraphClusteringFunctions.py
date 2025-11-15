@@ -176,6 +176,61 @@ def Algorithm1(G, ell, n_init = 'auto', rw = False, tau=0):
     
     return kmeans.labels_
 
+def Algorithm1FIXED(G, ell, n_init = 'auto', rw = False, tau=0):
+    """
+    Algorithm 1 as found in
+    "Hermitian matrices for clustering directed graphs: insights and applications"
+    
+    Parameters
+     G: nx.DiGraph
+     ell: number of eigenpairs to use
+     rw: (bool) if do random walk Hermitian A or not
+     
+    Returns
+     partition: partition of nodes into clusters
+     
+    NOTES: Important imports implicit here
+     eigh:    scipy.linalg.eigh
+     KMeans:  sklearn.clusters.KMeans
+     np:      numpy
+    """
+    N = len(G)
+    
+    if not rw:
+        A = Hermitian_A(G)
+        
+    if rw:
+        A = Hermitian_A(G)
+        #d = np.abs(A)@np.ones(N) # more efficient way surely but later
+        d = np.sum(np.abs(A), axis=1) # row sums of |A|
+        d = d + tau
+        d = d**(-1/2)
+        A = np.diag(d)@A
+        
+        
+    w, v = eigh(A, subset_by_index = [N-ell, N-1]) # w is the ell largest eigenvalues
+    #P = v@v.conj().T # v is N x ell matrix of ell largest eigenvectors
+    #NOTE!!: possible difference here from paper
+    #      as we don't use an \epsilon, also w has the largest, not
+    #      largest magnitude. Results haven't seemed to change too much
+    #      but probably good to correct at some point
+    w_small, v_small = eigh(A, subset_by_index = [0, ell - 1])
+    potential_w = np.concatenate((w, w_small))
+    potential_v = np.hstack((v, v_small))
+    
+    V = potential_v[:,np.argsort(potential_w)[::-1][:ell]]
+    P = V@V.conj().T # V is N x ell matrix of ell largest magnitude eigenvectors
+        
+    
+    # Do kmeans on the rows of P
+    # kmeans doesn't work on complex
+    #  so make the dimension twice as large but real valued
+    P2N = np.hstack([P.real, P.imag])
+    
+    kmeans = KMeans(n_clusters = ell, n_init=n_init) #consider putting a random_state in for testing
+    kmeans.fit(P2N)
+    
+    return kmeans.labels_
 
 # In[ ]:
 
@@ -667,3 +722,354 @@ def iterative_small_fixes(G, target, true_labels, maxiters = 20):
         
     return cl_list, ari_list
 
+############################################
+# RECLASSIFY SINGLE NODE STUFF
+############################################
+def meta_edge_agreement_score(G, u, cl, meta_edge):
+    """
+    rate how well node u aligns with meta_edge (more positive means better)
+    
+    Input
+     G: nx.DiGraph
+     u: (int) the vertex in question
+     cl: (np.array) the clustering. cl[u] = k if u is in cluster k
+     meta_edge: (tuple) the meta_edge in question (e.g. (Ci, Cj))
+    """
+    score = 0
+    C0 = meta_edge[0]
+    C1 = meta_edge[1]
+    
+    if cl[u] == C0:
+        # look for edges u --> v
+        for v in G.neighbors(u):
+            if cl[v] == C1:
+                score += 1
+        for v in G.predecessors(u):
+            if cl[v] == C1:
+                score -= 1
+    
+    if cl[u] == C1:
+        # look for edges u <-- v
+        for v in G.predecessors(u):
+            if cl[v] == C0:
+                score += 1
+        for v in G.neighbors(u):
+            if cl[v] == C0:
+                score -= 1
+        
+    if cl[u] != C0 and cl[u] != C1:
+        raise ValueError("node u must be in one of the clusters in the meta_edge")
+    
+    return score
+
+
+def meta_node_agreement_score(G, u, cl, meta_edges):
+    """
+    Add the scores from meta_edge_agreement_score for each edge in meta_edge
+    to see how well in agreement node u is with it's current cluster assignment.
+    Intended use: know cl[u] == k. Input meta_edges that have one endpoint being k.
+
+    Inputs:
+     G - nx.DiGraph
+     u - (int) node in G
+     cl - (list) clusterization cl[i] = k means node i is in cluster k
+     meta_edges - (list) list of directed edges (e.g. meta_edges = [(1,2), (2,3), (3,1)])
+    """
+    total_score = 0
+    
+    for edge in meta_edges:
+        if cl[u] in edge:
+            total_score += meta_edge_agreement_score(G, u, cl, edge)
+            
+    return total_score
+
+
+def reclassify_single_nodes_iterative(G, k, num_edges, max_iter = 10, get_ari_each_step = True, true_labels = []):
+    """
+    Seek to improve Clustering given by Herm(G, k) by trying to
+    reclassify nodes one at a time by seeking for a meta node (community)
+    they better agree with.
+    Begin by using Herm(G,k) and then make the implied meta matrix but
+    keep only the num_edges largest positive values
+    
+    Inputs:
+     G - nx.DiGraph
+     k - (int) Number of clusters
+     num_edges - (int) Number of edges we know ahead of time are in the meta graph
+     max_iter - (int) Max number of times to try to reclassify a node
+     get_ari_each_step - (bool)
+     true_labels - (list) list of ints where true_labels[i] = k if node i is in cluster k
+     
+    Returns:
+     C - (list) the new clustering
+     the_ari_scores - (list) the ari_scores calculated at each step.
+     
+    Note: Assumes nodes are numbered 0, 1, ..., len(G) - 1
+    """
+    N = len(G)
+    C = Algorithm1FIXED(G, k)
+    M_0 = cutscore_meta_matrix(G, C, signed=True)
+    
+    if get_ari_each_step and len(true_labels) == N:
+        the_ari_scores = [adjusted_rand_score(true_labels, C)]
+    
+    # find the largest entries
+    M_0_1d = np.ravel(M_0)
+    big_entry_index = np.argsort(np.ravel(M_0))[::-1][:num_edges]
+    M = np.zeros_like(M_0_1d)
+    M[big_entry_index] = M_0_1d[big_entry_index]
+    M = M.reshape(M_0.shape)
+    
+    # the edges the first cluster decided we have
+    meta_edges = [tuple(e) for e in np.argwhere(M > 0)]
+    
+    curr_iter = 0
+    while curr_iter < max_iter:
+        # rank the nodes unhappiest to happiest
+        node_happiness = []
+        for i in range(N):
+            Ci = C[i]
+            Ci_edges = [e for e in meta_edges if Ci in e]
+            node_happiness.append(meta_node_agreement_score(G, i, C, Ci_edges))
+            
+        u_sad = np.argmin(node_happiness)
+        C_sad = C[u_sad]
+        
+        # find a better fit for u_sad
+        happiest_cluster = C_sad
+        happiest_score = node_happiness[u_sad]
+        for clust in range(k):
+            C_temp = [num for num in C]
+            C_temp[u_sad] = clust
+            clust_edges = [e for e in meta_edges if clust in e]
+            curr_score = meta_node_agreement_score(G, u_sad, C_temp, clust_edges)
+            if curr_score > happiest_score:
+                happiest_cluster = clust
+                happiest_score = curr_score
+                
+        # No change :(
+        if C_sad == happiest_cluster:
+            if get_ari_each_step:# and len(true_labels) > 0:
+                return C, the_ari_scores
+            return C
+        
+        # make the change in cluster membership
+        C[u_sad] = happiest_cluster
+        if get_ari_each_step:# and len(true_labels) == N:
+            the_ari_scores.append(adjusted_rand_score(true_labels, C))
+        
+        curr_iter += 1
+        if curr_iter > max_iter:
+            break
+    if get_ari_each_step:# and len(true_labels) == N:
+        return C, the_ari_scores
+    return C
+
+
+def reclassify_single_nodes_iterativeV2(G, k, num_edges, max_iter = 10, get_ari_each_step = True, true_labels = []):
+    """
+    Seek to improve Clustering given by Herm(G, k) by trying to
+    reclassify nodes one at a time by seeking for a meta node (community)
+    they better agree with.
+    Begin by using Herm(G,k) and then make the implied meta matrix but
+    keep only the num_edges largest positive values
+    
+    V2: Here we recalculate the implied meta matrix after each reassignment
+    
+    Inputs:
+     G - nx.DiGraph
+     k - (int) Number of clusters
+     num_edges - (int) Number of edges we know ahead of time are in the meta graph
+     max_iter - (int) Max number of times to try to reclassify a node
+     get_ari_each_step - (bool)
+     true_labels - (list) list of ints where true_labels[i] = k if node i is in cluster k
+     
+    Returns:
+     C - (list) the new clustering
+     the_ari_scores - (list) the ari_scores calculated at each step.
+     
+    Note: Assumes nodes are numbered 0, 1, ..., len(G) - 1
+    """
+    N = len(G)
+    C = Algorithm1FIXED(G, k)
+    M_0 = cutscore_meta_matrix(G, C, signed=True)
+    
+    # want the ARI score and provided some true labels to compare with
+    if get_ari_each_step and len(true_labels) == N:
+        the_ari_scores = [adjusted_rand_score(true_labels, C)]
+    
+    # find the largest entries
+    M_0_1d = np.ravel(M_0)
+    big_entry_index = np.argsort(np.ravel(M_0))[::-1][:num_edges]
+    M = np.zeros_like(M_0_1d)
+    M[big_entry_index] = M_0_1d[big_entry_index]
+    M = M.reshape(M_0.shape)
+    
+    # the edges the first cluster decided we have
+    meta_edges = [tuple(e) for e in np.argwhere(M > 0)]
+    
+    curr_iter = 0
+    while curr_iter < max_iter:
+        # score the nodes on how happy or unhappy they are
+        #  in their current cluster assignment
+        node_happiness = []
+        for i in range(N):
+            Ci = C[i]
+            Ci_edges = [e for e in meta_edges if Ci in e]
+            node_happiness.append(meta_node_agreement_score(G, i, C, Ci_edges))
+            
+        u_sad = np.argmin(node_happiness)
+        C_sad = C[u_sad]
+        
+        # find a better fit for u_sad
+        happiest_cluster = C_sad
+        happiest_score = node_happiness[u_sad]
+        for clust in range(k):
+            C_temp = [num for num in C]
+            C_temp[u_sad] = clust
+            clust_edges = [e for e in meta_edges if clust in e]
+            curr_score = meta_node_agreement_score(G, u_sad, C_temp, clust_edges)
+            if curr_score > happiest_score:
+                happiest_cluster = clust
+                happiest_score = curr_score
+                
+        # No change :( Most unhappy node is already in its best possible cluster
+        if C_sad == happiest_cluster:
+            if get_ari_each_step:# and len(true_labels) > 0:
+                return C, the_ari_scores
+            return C
+        
+        # make the change in cluster membership
+        C[u_sad] = happiest_cluster
+        if get_ari_each_step:# and len(true_labels) == N:
+            the_ari_scores.append(adjusted_rand_score(true_labels, C))
+        
+        # This version: Update the meta matrix too
+        M_0 = cutscore_meta_matrix(G, C, signed=True)
+        M_0_1d = np.ravel(M_0)
+        big_entry_index = np.argsort(np.ravel(M_0))[::-1][:num_edges]
+        M = np.zeros_like(M_0_1d)
+        M[big_entry_index] = M_0_1d[big_entry_index]
+        M = M.reshape(M_0.shape)
+        meta_edges = [tuple(e) for e in np.argwhere(M > 0)]
+        
+        # Hit maximum iterations?
+        curr_iter += 1
+        if curr_iter > max_iter:
+            break
+    if get_ari_each_step:# and len(true_labels) == N:
+        return C, the_ari_scores
+    return C
+
+# Alter code to track that info
+def reclassify_single_nodes_iterative_TRACK(G, k, num_edges, max_iter = 10, get_ari_each_step = True, true_labels = []):
+    """
+    Seek to improve Clustering given by Herm(G, k) by trying to
+    reclassify nodes one at a time by seeking for a meta node (community)
+    they better agree with.
+    Begin by using Herm(G,k) and then make the implied meta matrix but
+    keep only the num_edges largest positive values
+    
+    Inputs:
+     G - nx.DiGraph
+     k - (int) Number of clusters
+     num_edges - (int) Number of edges we know ahead of time are in the meta graph
+     max_iter - (int) Max number of times to try to reclassify a node
+     get_ari_each_step - (bool)
+     true_labels - (list) list of ints where true_labels[i] = k if node i is in cluster k
+     
+    Returns:
+     C - (list) the new clustering
+     the_ari_scores - (list) the ari_scores calculated at each step.
+     
+    Note: Assumes nodes are numbered 0, 1, ..., len(G) - 1
+    
+    NEW: This returns a list of the clusters, the ari_scores, 
+    what node changed at what step, where it went,
+    old happy score vs new happy score, the neighbors of the moved nodes,
+    the implied meta matrix
+    
+    NOTE: In this notebook I added to this function as it went,
+          Consequently, some of the first cells will have this
+          function returning fewer things.
+          Be aware of this if you try to just copy and paste
+          some cells to run more experiments
+    """
+    N = len(G)
+    C = Algorithm1FIXED(G, k)
+    M_0 = cutscore_meta_matrix(G, C, signed=True)
+    
+    if get_ari_each_step and len(true_labels) == N:
+        the_ari_scores = [adjusted_rand_score(true_labels, C)]
+        
+    the_nodes_moved = []
+    the_moves_made = []
+    the_clusters = [[num for num in C]]
+    before_after_happy_scores = []
+    neighbors_of_moved = []
+    
+    # find the largest entries
+    M_0_1d = np.ravel(M_0)
+    big_entry_index = np.argsort(np.ravel(M_0))[::-1][:num_edges]
+    M = np.zeros_like(M_0_1d)
+    M[big_entry_index] = M_0_1d[big_entry_index]
+    M = M.reshape(M_0.shape)
+    
+    # the edges the first cluster decided we have
+    meta_edges = [tuple(e) for e in np.argwhere(M > 0)]
+    
+    curr_iter = 0
+    while curr_iter < max_iter:
+        # rank the nodes unhappiest to happiest
+        node_happiness = []
+        for i in range(N):
+            Ci = C[i]
+            Ci_edges = [e for e in meta_edges if Ci in e]
+            node_happiness.append(meta_node_agreement_score(G, i, C, Ci_edges))
+            
+        # find the node with smallest agreement score
+        u_sad = np.argmin(node_happiness)
+        C_sad = C[u_sad]
+        
+        # append information to other info we are returning
+        #  to test and understand the algorithm
+        the_nodes_moved.append(u_sad)
+        the_moves_made.append([C_sad, -1])
+        before_after_happy_scores.append([np.min(node_happiness), np.inf])
+        neighbors_of_moved.append([list(G.neighbors(u_sad)), list(G.predecessors(u_sad))])
+        
+        # find a better fit for u_sad
+        happiest_cluster = C_sad
+        happiest_score = node_happiness[u_sad]
+        for clust in range(k):
+            C_temp = [num for num in C]
+            C_temp[u_sad] = clust
+            clust_edges = [e for e in meta_edges if clust in e]
+            curr_score = meta_node_agreement_score(G, u_sad, C_temp, clust_edges)
+            if curr_score > happiest_score:
+                happiest_cluster = clust
+                happiest_score = curr_score
+                
+        the_moves_made[-1][1] = happiest_cluster
+        #the_clusters.append([num for num in C])
+        # No change :(
+        if C_sad == happiest_cluster:
+            if get_ari_each_step:# and len(true_labels) > 0:
+                return the_clusters, the_ari_scores, the_nodes_moved, the_moves_made, before_after_happy_scores, neighbors_of_moved, M
+            return C
+        
+        # make the change in cluster membership
+        C[u_sad] = happiest_cluster
+        the_clusters.append([num for num in C])
+        before_after_happy_scores[-1][1] = happiest_score
+        if get_ari_each_step:# and len(true_labels) == N:
+            the_ari_scores.append(adjusted_rand_score(true_labels, C))
+        
+        # Have we done too many rounds?
+        curr_iter += 1
+        if curr_iter > max_iter:
+            break
+            
+    if get_ari_each_step:# and len(true_labels) == N:
+        return the_clusters, the_ari_scores, the_nodes_moved, the_moves_made, before_after_happy_scores, neighbors_of_moved, M
+    return C
